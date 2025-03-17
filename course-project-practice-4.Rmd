@@ -1,0 +1,2176 @@
+---
+title: "STA 141 project"
+author: "Chenshuo Zhang"
+output: html_document
+date: "2025-03-16"
+---
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(xgboost)
+library(randomForest)
+library(pROC)
+library(readr)
+
+```
+# Abstract:
+This project utilizes R studio to process neural data from 18 sessions and two test sets (test1, test2), analyzing mice’s decision-making under visual stimuli(2019,Steinmetz), and using Exploratory Data Analysis (EDA) to visualizes success rates and neural spike patterns, by feature engineering.  This project used and trained four models,which are Xgboost, Random forest,Svm, logistic regression ,and evaluated with confusion matrices, ROC curves, and AUC. Finally, test the data in the end.
+
+# introduction:
+This project will be analyzing the neural activity in mice and their response to certain stimuli.
+The dataset includes varying contrast levels and corresponding behavioral responses. Our workflow involves data loading, exploratory analysis (EDA), feature engineering, model training, and evaluation, culminating in model validation on test datasets.
+
+When:left contrast > right contrast, success (1) if turning the wheel to the right and failure (-1) otherwise.  
+     right contrast > left contrast, success (1) if turning the wheel to the left and failure (-1) otherwise.  
+     both left and right contrasts are zero, success (1) if holding the wheel still and failure (-1) otherwise. 
+     left and right contrasts are equal but non-zero, left or right will be randomly chosen (50%) as the correct choice. 
+    
+All code is in the appendix which located in the end
+
+The structure of this report is below:
+
+Step1:load data
+
+Step2: Initial Exploration (EDA) of Session 7(using session7 as an example)
+
+Step3: Data Processing
+
+Step 4: more Visualizations / EDA
+
+Step 5: Prepare Data for Modeling
+
+Step 6:predictive modeling and test by session 1 and session 18
+
+step 7: Test data 
+
+step 8: Discussion
+
+step 9: Code appendix
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 1: Load Data
+# (A) Read the 18 session data into a list
+session_list <- vector("list", length = 18)
+for (sid in seq_len(18)) {
+  file_path <- paste0("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\session", sid, ".rds")
+  session_list[[sid]] <- readRDS(file_path)
+
+cat("Session", sid, "loaded from:", file_path, "\n")
+}
+
+
+# (B) Read test data (test1.rds and test2.rds)
+test1 <- readRDS("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\test1.rds") 
+test2 <- readRDS("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\test2.rds")
+session <- session_list
+
+```
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 2: Data Exploration (EDA) of Session 7
+
+
+dims_trial12 <- dim(session[[7]]$spks[[12]])
+cat("Number of neurons x Number of time bins:", dims_trial12, "\n")
+
+
+areas_s7 <- session[[7]]$brain_area
+unique_areas_s7 <- unique(areas_s7)
+cat("Total number of brain regions:", length(unique_areas_s7), "\n")
+cat("List of brain regions:\n")
+print(unique_areas_s7)
+
+feedback_s7 <- session[[7]]$feedback_type
+cat("Total number of trials:", length(feedback_s7), "\n")
+cat("Successful trials (1):", sum(feedback_s7 == 1), "\n")
+cat("Failed trials (-1):", sum(feedback_s7 == -1), "\n")
+cat("Success rate in session 7:", mean(feedback_s7 == 1), "\n")
+
+# Calculate overall success rate across all 18 sessions
+acc_success_count <- 0
+acc_trial_count   <- 0
+for(sid in seq_along(session)) {
+  current_feedback <- session[[sid]]$feedback_type
+  acc_success_count <- acc_success_count + sum(current_feedback == 1)
+  acc_trial_count   <- acc_trial_count + length(current_feedback)
+}
+overall_success_rate <- acc_success_count / acc_trial_count
+#  Example: Display part of the spike matrix for session 7, trial 12
+example_spk_7 <- session[[7]]$spks[[12]][1:5, 1:8]
+print(example_spk_7)
+```
+
+We can see  the data from the Exploratory data analysis (EDA) reveals that in session 7 trial 12, 584 neurons recorded spike activity across 40 time bins, covering 8 distinct brain regions (e.g., VPL, CA3, SSp). The mouse achieved a success rate of 67.06% in 252 trials, with an overall success rate of 71.01% across all sessions. 
+
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+#  Plot histogram of total spike counts per neuron in trial 12
+spike_sums_trial12 <- rowSums(session[[7]]$spks[[12]])
+hist(
+  spike_sums_trial12,
+  main = "Histogram of Total Spike Counts per Neuron (Trial 12, Session 7)",
+  xlab = "Total Spikes per Neuron"
+)
+
+
+
+```
+
+
+Most neurons exhibit low spike counts, primarily within the 0-5 range, suggesting that the majority of neurons were minimally active during this trial.
+Only a small fraction of neurons show higher spike counts (>10), with frequency decreasing, indicating that highly active neurons are rare.
+
+
+
+
+# Data integration
+
+The primary goal of this data integration step is to aggregate trial data across multiple sessions, making it suitable for further analysis and modeling. The key steps are list below:
+
+1.Extracting Single-Trial Data (single_trial_info function):Computes total spikes per brain region (region_sum), neuron count (neuron_count), and mean spike count (region_mean).
+Stores trial-specific information such as contrast levels (contrast_left, contrast_right) and feedback type (feedback_type).
+
+2.Session-Level Aggregation (summarize_session function):Iterates through all trials in a session and calls single_trial_info for feature extraction.Adds metadata like mouse name (mouse_name), experiment date (date_exp), and session ID (session_id).
+3.Merging Data Across Sessions (all_session_data):Consolidates data from 18 sessions into all_session_data, forming region-level spike summaries.
+
+4.Computes additional features like success indicator (success = 1 if feedback_type == 1, else 0) and contrast difference (contrast_diff = abs(contrast_left - contrast_right)).
+
+5.Time-Series Feature Calculation (per_trial_bin_averages):Computes average neuron spikes per time bin to create time-series-based neural features, enabling analysis of neural firing patterns over time.
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 3: Data integration
+
+
+# Summarize a single trial:
+#     - For each brain region, compute sum of spikes, number of neurons, mean spikes
+#     - Include trial-specific info (contrast, feedback, etc.)
+single_trial_info <- function(sess_idx, trial_idx) {
+  spikes_mat <- session[[sess_idx]]$spks[[trial_idx]]
+  if (any(is.na(spikes_mat))) {
+    message("Warning: Missing values in session[[", sess_idx, "]] trial ", trial_idx)
+  }
+  
+  # Summation by region
+  region_vec <- session[[sess_idx]]$brain_area
+  spike_sums <- rowSums(spikes_mat)
+  
+  # Create a data frame grouped by brain regions
+  df <- tibble(
+    region_label = region_vec,
+    total_spikes = spike_sums
+  ) %>%
+    group_by(region_label) %>%
+    summarize(
+      region_sum = sum(total_spikes),
+      neuron_count = n(),
+      region_mean = mean(total_spikes)
+    ) %>%
+    ungroup()
+  
+  # Append trial-level info
+  df$trial_id       <- trial_idx
+  df$contrast_left  <- session[[sess_idx]]$contrast_left[trial_idx]
+  df$contrast_right <- session[[sess_idx]]$contrast_right[trial_idx]
+  df$feedback_type  <- session[[sess_idx]]$feedback_type[trial_idx]
+  
+  # Return the result
+  df
+}
+
+
+# Aggregate a whole session's trials
+summarize_session <- function(sess_idx) {
+  n_trials <- length(session[[sess_idx]]$spks)
+  all_data <- vector("list", n_trials)
+  
+  for (tid in seq_len(n_trials)) {
+    all_data[[tid]] <- single_trial_info(sess_idx, tid)
+  }
+  
+  # Merge them row-wise
+  combined_df <- bind_rows(all_data)
+  
+  # Attach session-level fields
+  combined_df$mouse_name <- session[[sess_idx]]$mouse_name
+  combined_df$date_exp   <- session[[sess_idx]]$date_exp
+  combined_df$session_id <- sess_idx
+  
+  combined_df
+}
+
+
+# (C) Build the final data set across all sessions
+full_session_list <- vector("list", 18)
+for (sid in 1:18) {
+  full_session_list[[sid]] <- summarize_session(sid)
+}
+all_session_data <- bind_rows(full_session_list)
+
+# Create additional columns for analysis
+# - success indicator: 1 if feedback == 1, else 0
+# - absolute difference in left/right contrast
+all_session_data <- all_session_data %>%
+  mutate(
+    success = if_else(feedback_type == 1, 1, 0),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+
+cat("Dimensions of all_session_data:", dim(all_session_data), "\n")
+
+
+# (D) Create functional-like data: 
+#     Each trial => average across neurons for each of the 40 time bins
+per_trial_bin_averages <- function(sess_idx, trial_idx) {
+  spikes_mat <- session[[sess_idx]]$spks[[trial_idx]]
+  
+  # Each column is a time bin; compute average across all neurons for each bin
+  bin_means <- colMeans(spikes_mat, na.rm = TRUE)
+  
+  # Give each bin a name to avoid the error
+  names(bin_means) <- paste0("bin", seq_along(bin_means))
+  
+  # Turn it into a single-row tibble
+  out_row <- as_tibble_row(bin_means)
+  
+  # Add relevant trial info
+  out_row$trial_id       <- trial_idx
+  out_row$contrast_left  <- session[[sess_idx]]$contrast_left[trial_idx]
+  out_row$contrast_right <- session[[sess_idx]]$contrast_right[trial_idx]
+  out_row$feedback_type  <- session[[sess_idx]]$feedback_type[trial_idx]
+  return(out_row)
+}
+
+
+summarize_session_bins <- function(sess_idx) {
+  n_trials <- length(session[[sess_idx]]$spks)
+  trial_list <- vector("list", n_trials)
+  
+  for (tid in seq_len(n_trials)) {
+    trial_list[[tid]] <- per_trial_bin_averages(sess_idx, tid)
+  }
+  
+  # Combine rows
+  result_df <- bind_rows(trial_list)
+  
+  # Attach session-level info
+  result_df$mouse_name <- session[[sess_idx]]$mouse_name
+  result_df$date_exp   <- session[[sess_idx]]$date_exp
+  result_df$session_id <- sess_idx
+  result_df
+}
+
+# Build a combined table for bin-based data
+bin_data_list <- vector("list", 18)
+for (sid in 1:18) {
+  bin_data_list[[sid]] <- summarize_session_bins(sid)
+}
+all_bin_data <- bind_rows(bin_data_list)
+
+# Add success indicator & contrast difference for the bin-based data as well
+all_bin_data <- all_bin_data %>%
+  mutate(
+    success = if_else(feedback_type == 1, 1, 0),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+
+# (E) Quick check on the newly created data
+
+print(head(all_session_data, 6))
+```
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+print(head(all_bin_data, 6))
+```
+In this trial, each row contains 40 time bins. 
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 4: more Visualizations / EDA after data integration
+
+
+# 1) Visualize how success rates change over trials
+#    We create trial "bins" and then compute the average success rate within each bin.
+
+# (a) Define trial groups (e.g., groups of 25 trials each)
+all_session_data$trial_bin <- cut(
+  all_session_data$trial_id,
+  breaks = seq(0, max(all_session_data$trial_id), by = 25),
+  include.lowest = TRUE
+)
+
+# Rename factor levels (optional, if we want to remove bracket-like text)
+levels(all_session_data$trial_bin) <- seq(25, length.out = length(levels(all_session_data$trial_bin)), by = 25)
+
+# (b) Aggregate success rate within each session & trial_bin
+grouped_success <- all_session_data %>%
+  group_by(session_id, trial_bin) %>%
+  summarize(success_rate = mean(success), .groups = "drop")
+
+# (c) Plot a bar chart of success rate for each session, faceted by session_id
+ggplot(grouped_success, aes(x = trial_bin, y = success_rate)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ session_id, ncol = 5) +
+  theme_minimal() +
+  labs(
+    title = "Success Rate Across Sessions by Trial Group",
+    x = "Trial Group (bins of 25 trials)",
+    y = "Success Rate"
+  )
+```
+
+
+This histogram visualizes how success rates change over trials groups
+key findings:
+
+
+Many sessions show initially high or increasing success rates, followed by a decline towards later trials (e.g., sessions 1, 2,4,5 6,8,18).
+Some sessions exhibit relatively stable success rates throughout (e.g., sessions 4, 7, 10, 11, 14,17).
+
+
+In some sessions (e.g., sessions 3, 8, 13, 15), success rates increase early but decline later, suggesting that mice may be adapting to the task at first but later experiencing fatigue or strategy shifts.
+Other sessions (e.g., sessions 7, 10, 11) show stable success rates, indicating consistent performance.
+
+
+Some sessions display more fluctuations in success rate, suggesting variability in individual mice or experimental conditions.
+For instance, sessions 9, 12, and 17 exhibit noticeable variability in success rates across trial bins.
+```{r}
+# 2) Visualize overall spike trends over trial_id
+#    Here we can use all_session_data or all_bin_data to show how average spikes vary.
+cat("\n=== Plotting average spike counts by trial ===\n")
+
+# For region-level data:
+avg_spike_df <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(mean_spike_region = sum(region_sum) / sum(neuron_count), .groups = "drop")
+
+# (a) A line chart of mean_spike_region vs trial_id, using LOESS smoothing
+ggplot(avg_spike_df, aes(x = trial_id, y = mean_spike_region)) +
+  geom_line() +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  facet_wrap(~ session_id, ncol = 5) +
+  labs(
+    title = "Average Spike Rate by Trial",
+    x = "Trial ID",
+    y = "Mean Spike Rate (region-level)"
+  ) +
+  theme_bw()
+
+```
+
+This part visualizes how neural spike rates evolve over trials,
+Key findings:
+
+
+ sessions (1, 3, 9, 11,18), spike rates tend to decline over trials, suggesting reduced neural activity over time, potentially due to learning, fatigue, or adaptation effects.
+ sessions (2,4,6, 10, 14, 16) exhibit relatively stable neural activity, with smaller fluctuations.
+
+
+sessions (7,8, 9, 10,11) show higher fluctuations, indicating that neural responses might be more sensitive to task difficulty or behavioral variation.
+sessions (4, 5, 6, 13,14,15,16) exhibit low and stable spike rates, potentially due to experimental conditions or individual differences.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Additional EDA: Distribution of Success/Failure per Session
+library(ggplot2)
+library(dplyr)
+
+# 1) Summarize the success/failure in each session
+
+trial_level <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(success = first(success), .groups="drop")
+
+# 2) Count successes/failures for each session
+success_counts <- trial_level %>%
+  group_by(session_id, success) %>%
+  summarize(n = n(), .groups="drop")
+
+# 3) Make a bar chart
+ggplot(success_counts, aes(x = factor(session_id), y = n, fill = factor(success))) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Success/Failure Count per Session",
+    x = "Session ID",
+    y = "Count of Trials",
+    fill = "Success"
+  ) +
+  theme_minimal()
+
+```
+
+This bar chart illustrates the count of successful (blue) versus failed (red) trials across session.
+In most sessions, the number of successful trials (blue bars) significantly exceeds the number of failures (red bars), indicating a generally high success rate. However, there are noticeable differences among sessions in both the total number of trials and the success/failure ratio. For instance, sessions 6, 10, and 15 feature a larger total number of trials with a higher volume of successes, whereas sessions 1, 2, 13, and 18 have relatively fewer trials and varying proportions of failures.
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+# Boxplot
+library(dplyr)
+library(ggplot2)
+
+# 1) Build the data frame (total_spikes per neuron)
+spike_summaries_s7 <- lapply(seq_along(session[[7]]$spks), function(trial_i) {
+  spk_mat <- session[[7]]$spks[[trial_i]]
+  neuron_sums <- rowSums(spk_mat, na.rm = TRUE)
+  data.frame(
+    neuron_id    = seq_along(neuron_sums),
+    brain_region = session[[7]]$brain_area,
+    total_spikes = neuron_sums,
+    trial_id     = trial_i
+  )
+}) %>%
+  bind_rows()
+
+# 2) Plot
+ggplot(spike_summaries_s7, aes(x = brain_region, y = total_spikes)) +
+  # Boxplot with outliers hidden so they don't get double-drawn
+  geom_boxplot(outlier.shape = NA) +
+  # Jitter layer for actual points
+  geom_jitter(width = 0.03, alpha = 0.1, color = "gray") +
+  # Zoom in on 0–10 so the box and points are visible
+  coord_cartesian(ylim = c(0, 10)) +
+  labs(
+    title = "Distribution of Total Spikes by Brain Region (Session 7)",
+    x = "Brain Region",
+    y = "Total Spikes (sum across time bins per neuron)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+This plot illustrates the distribution of total spike counts per neuron across different brain regions (CA3, CP, EPd, LD, PIR, root, SSp, VPL) in Session 7.  
+Most neurons exhibit relatively low spike totals with a few high outliers, suggesting a long-tailed distribution. Certain regions (e.g., PIR, VPL) show higher boxplot medians, indicating more robust firing in some neurons. This implies that specific brain areas may be more engaged during the decision-making process, warranting further analysis in relation to behavioral outcomes.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Additional EDA: Histogram of Spike Sums Per Trial
+
+library(dplyr)
+library(ggplot2)
+
+trial_spike_totals <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(total_spikes_trial = sum(region_sum), .groups="drop")
+
+# Plot a histogram of total_spikes_trial
+ggplot(trial_spike_totals, aes(x = total_spikes_trial)) +
+  geom_histogram(binwidth = 50,color="white") +
+  labs(
+    title = "Histogram of Total Spikes per Trial (All Sessions)",
+    x = "Total Spikes in Trial",
+    y = "Count of Trials"
+  ) +
+  theme_minimal()
+
+```
+This histogram shows the distribution of total spike counts per trial across all sessions. The bulk of the data clusters around 800–1200 spikes, indicating that most trials fall within this moderate spike range. There is a noticeable right tail extending beyond 2000 spikes, representing trials with particularly high neural firing. This pattern suggests that while the majority of trials exhibit moderate overall activity, a subset experiences more intense neuronal responses. Differences in trial-level spikes may stem from variations in stimulus contrast, brain region involvement, or individual subject differences.
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+# 3) PCA on the bin-based data 
+cat("\n=== Performing PCA on time-bin features and plotting results ===\n")
+
+# (a) Extract only the columns corresponding to the 40 time bins
+bin_columns <- names(all_bin_data)[grepl("^bin", names(all_bin_data))]
+features <- all_bin_data[, bin_columns]
+
+# (b) Scale and do PCA
+scaled_features <- scale(features)
+pca_fit <- prcomp(scaled_features, center = FALSE, scale. = FALSE)
+
+# (c) Create a data frame for the first two principal components
+pca_results <- data.frame(
+  PC1 = pca_fit$x[, 1],
+  PC2 = pca_fit$x[, 2],
+  session_id = all_bin_data$session_id,
+  mouse_name = all_bin_data$mouse_name
+)
+
+# (d) Plot PC1 vs PC2, colored by session_id
+ggplot(pca_results, aes(x = PC1, y = PC2, color = factor(session_id))) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "PCA of Bin-based Spike Averages (PC1 vs PC2)",
+    x = "PC1",
+    y = "PC2",
+    color = "Session ID"
+  )
+```
+This scatter plot shows PC1 vs PC2 from a Principal Component Analysis (PCA) performed on 40 time-bin-based average spike rates. 
+Key findings
+1. Distribution Shape
+The data spans broadly from left (negative PC1) to right (positive PC1). Most points cluster in the central-right region, indicating that neural activity patterns across sessions share a similar principal component structure.
+2.Overlap Among Sessions
+Most sessions show extensive overlap, suggesting that their underlying time-bin neural features are not drastically different along the first two principal components.
+Some sessions (e.g., Sessions 2 and 9) appear more skewed toward the lower-left portion, indicating potentially distinct patterns in PC1 or PC2 values compared to the bulk of other sessions.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+ggplot(pca_results, aes(PC1, PC2, color = mouse_name)) + geom_point()+theme_minimal() +
+  labs(
+    title = "PCA of Bin-based Spike Averages (PC1 vs PC2)",
+    x = "PC1",
+    y = "PC2",
+    color = "Session ID"
+  )
+
+cat("\nVisualizations complete.\n")
+
+```
+This plot displays the PCA scatter plot (PC1 vs. PC2) for time-bin-based average spike rates from four mice (Cori, Forssmann, Hench, Lederberg)
+Key findings:
+Most data points spread horizontally from negative to positive PC1 values, suggesting that PC1 is a dominant source of variation among trials.
+There is also noticeable spread along PC2, indicating secondary differences among trials in this second principal component
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+# Step 5: Prepare Data for Modeling
+
+
+# Identify time-bin columns
+time_bin_cols <- grep("^bin", names(all_bin_data), value = TRUE)
+
+# Define a vector of columns to keep in addition to bins
+extra_predictors <- c( "session_id","trial_id" ,"contrast_left", "contrast_right", "contrast_diff")
+all_predictor_cols <- c(extra_predictors, time_bin_cols)
+
+# Extract the data subset
+predictor_data <- all_bin_data[, all_predictor_cols]
+
+
+label <- all_bin_data$success
+
+
+#     Convert categorical features to dummy variables automatically
+X <- model.matrix(~ . , data = predictor_data)
+
+
+cat("Design matrix X built with dimensions:", dim(X), "\n")
+
+set.seed(123)  # For reproducibility
+train_index <- createDataPartition(label, p = 0.80, list = FALSE)
+
+X_train <- X[train_index, ]
+X_test  <- X[-train_index, ]
+y_train <- label[train_index]
+y_test  <- label[-train_index]
+
+cat("Training set size:", nrow(X_train), "Testing set size:", nrow(X_test), "\n")
+
+cat("Success rate in training:", mean(y_train), "\n")
+cat("Success rate in testing:",  mean(y_test), "\n")
+
+
+```
+
+This step demonstrates typical steps for preparing data for a machine learning model, including feature selection, design matrix creation, and train/test splitting.
+
+
+
+# Predictive modeling(XGboost)
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+#Step 6:predictive modeling
+# Improved XGBoost Training with Tuned Params
+
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+
+params_improved <- list(
+  objective = "binary:logistic", # logistic regression for binary classification
+  eval_metric = "logloss",       
+  eta = 0.035,                    # smaller step size (learning rate)
+  max_depth = 8,                 # deeper trees can learn more complex patterns
+  subsample = 0.8,               # sample 80% of rows for each tree
+  colsample_bytree = 0.8,        # sample 80% of features for each tree
+  min_child_weight = 5           # minimum sum of instance weight (avoid overfitting)
+)
+
+set.seed(123)
+xgb_model_improved <- xgb.train(
+  params = params_improved,
+  data = dtrain,
+  nrounds = 300,                #  train rounds
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 10,   # stop if no improvement after 20 rounds
+  print_every_n = 50            # reduce consoe output frequency
+)
+
+# Generate predictions on test set
+pred_prob_improved <- predict(xgb_model_improved, newdata = X_test)
+pred_class_improved <- ifelse(pred_prob_improved > 0.5, 1, 0)
+
+# Evaluate
+cm_improved <- confusionMatrix(
+  factor(pred_class_improved),
+  factor(y_test),
+  positive = "1"
+)
+
+print(cm_improved$table)
+cat("Accuracy:", cm_improved$overall["Accuracy"], "\n")
+
+roc_obj_improved <- roc(response = y_test, predictor = pred_prob_improved)
+auc_improved <- auc(roc_obj_improved)
+cat("AUC:", auc_improved, "\n")
+
+```
+This code illustrates a binary classification using XGBoost.The model shows "logloss reduction" (`train: 0.3316`, `test: 0.4974`), indicating good convergence with no severe overfitting. "Accuracy is 74.31%", but the high false positive rate (231 misclassified failures) may affect real-world performance. "AUC of 0.785" suggests strong classification ability. Potential improvements include.
+
+## Test 50 data from session 1
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 7: Test on a Specific Session and test by session 1 and session 18
+
+
+# (A) Identify the rows in all_bin_data that correspond to session 1
+session_1_rows <- which(all_bin_data$session_id == 1)
+
+
+set.seed(111)
+test_index_s1 <- sample(session_1_rows, 50, replace = FALSE)
+
+# (B) Build the test data for these 50 trials
+test_data_s1 <- all_bin_data[test_index_s1, ]
+
+
+test_label_s1 <- test_data_s1$success
+
+predictor_cols_s1 <- c(
+  "session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff",
+  grep("^bin", names(test_data_s1), value = TRUE)
+)
+test_matrix_s1 <- model.matrix(~ ., data = test_data_s1[, predictor_cols_s1])
+
+# (C) Generate predictions using the previously trained XGBoost model
+s1_pred_prob <- predict(xgb_model_improved, newdata = test_matrix_s1)
+s1_pred_class <- ifelse(s1_pred_prob > 0.5, 1, 0)
+
+# (D) Evaluate performance on these 50 trials
+
+
+
+cm_s1 <- confusionMatrix(
+  factor(s1_pred_class),
+  factor(test_label_s1),
+  positive = "1"
+)
+print(cm_s1$table)
+cat("Accuracy on Session 1 subset:", cm_s1$overall["Accuracy"], "\n")
+
+# (E) ROC and AUC
+roc_s1 <- roc(response = test_label_s1, predictor = s1_pred_prob)
+auc_s1 <- auc(roc_s1)
+cat("AUC for Session 1 subset:", auc_s1, "\n")
+
+plot(roc_s1, main = "ROC Curve for Session 1 Subset")
+abline(a = 0, b = 1, col = "red", lty = 2)
+
+```
+## Conclusion for this model
+
+The model was tested on 50 randomly selected trials from Session 1, the model performed exceptionally well on Session 1, achieving an accuracy of 94% and an AUC of 0.97, indicating strong classification ability. The confusion matrix shows only three false positives and no false negatives, suggesting the model effectively differentiates between successful and failed trials in this session. The high AUC score (0.9706) confirms that the model can reliably distinguish between the two classes. This strong performance may indicate that Session 1 data aligns well with the model’s learned patterns, but further testing across other sessions is needed to ensure consistent generalization.
+
+### Test session 18
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Testing on Session 18
+
+
+# (A) Identify rows in 'all_bin_data' that correspond to session 18
+session_18_rows <- which(all_bin_data$session_id == 18)
+
+set.seed(111)  # Different seed from earlier to avoid overlap
+test_index_s18 <- sample(session_18_rows, 50, replace = FALSE)
+
+# (B) Build a test subset for these 50 trials
+test_data_s18 <- all_bin_data[test_index_s18, ]
+test_label_s18 <- test_data_s18$success
+
+# (C) Prepare the feature matrix using the same columns as the trained model
+predictor_cols_s18 <- c(
+  "session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff",
+  grep("^bin", names(test_data_s18), value = TRUE)
+)
+test_matrix_s18 <- model.matrix(~ ., data = test_data_s18[, predictor_cols_s18])
+
+# (D) Generate predictions using the previously trained XGBoost model
+s18_pred_prob  <- predict(xgb_model_improved, newdata = test_matrix_s18)
+s18_pred_class <- ifelse(s18_pred_prob > 0.5, 1, 0)
+
+# (E) Evaluate model performance on these 50 trials
+
+cm_s18 <- confusionMatrix(
+  factor(s18_pred_class),
+  factor(test_label_s18),
+  positive = "1"
+)
+print(cm_s18$table)
+cat("Accuracy on Session 18 subset:", cm_s18$overall["Accuracy"], "\n")
+
+# (F) ROC and AUC
+roc_s18 <- roc(response = test_label_s18, predictor = s18_pred_prob)
+auc_s18 <- auc(roc_s18)
+cat("AUC for Session 18 subset:", auc_s18, "\n")
+
+# Plot ROC
+plot(roc_s18, main = "ROC Curve for Session 18 Subset")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+
+```
+### Test result
+The model also performed good on Session 18, achieving an accuracy of 92% and an AUC of 0.953, indicating reliable classification ability. The confusion matrix shows only four false positives and no false negatives, demonstrating that the model correctly identifies all successful trials while slightly misclassifying some failures. The high AUC score (0.9534) suggests that the model maintains strong discriminative power in this session. Comparing with Session 1 (AUC = 0.97), the model's performance remains consistently high, reinforcing its robustness across different sessions, though slight variations suggest session-specific influences.
+
+# Predicting model-- Random forest
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Random Forest via randomForest Package
+
+# Convert y_train / y_test to factors (randomForest factor label)
+y_train_factor <- factor(y_train, levels = c(0,1))
+y_test_factor  <- factor(y_test, levels = c(0,1))
+
+# 1) Train the random forest
+set.seed(123)
+rf_model <- randomForest(
+  x = X_train,
+  y = y_train_factor,
+  ntree = 900,       # number of trees
+  mtry = 20,         # how many features randomly chosen at each split
+  importance = TRUE  # if you want variable importance
+)
+
+
+# 2) Predictions on the test set
+pred_rf_prob <- predict(rf_model, X_test, type = "prob")[, 2]
+pred_rf_class <- predict(rf_model, X_test, type = "response")
+
+# 3) Confusion Matrix + Accuracy
+cm_rf <- confusionMatrix(pred_rf_class, y_test_factor, positive = "1")
+cat("\nConfusion Matrix (RandomForest):\n")
+print(cm_rf$table)
+cat("Accuracy:", cm_rf$overall["Accuracy"], "\n")
+
+# 4) ROC & AUC
+roc_rf <- roc(
+  response  = y_test,      # still numeric 0 or 1
+  predictor = pred_rf_prob
+)
+cat("AUC:", auc(roc_rf), "\n")
+
+plot(roc_rf, main = "Random Forest ROC")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+cat("\nTop variables by importance:\n")
+importance(rf_model) |> head()
+```
+The Random Forest model achieved an accuracy of 73.62% and an AUC of 0.768, which is slightly lower than the XGBoost model (accuracy: 74.31%, AUC: 0.785), indicating a relatively weaker performance in classification. The confusion matrix shows a high number of false positives (242 misclassified failures) and false negatives (26 misclassified successes), suggesting room for improvement in balancing predictions.
+
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+s1_rf_pred_prob  <- predict(rf_model, test_matrix_s1, type="prob")[,2]
+s1_rf_pred_class <- predict(rf_model, test_matrix_s1, type="response")
+s18_rf_pred_prob  <- predict(rf_model, test_matrix_s18, type="prob")[,2]
+s18_rf_pred_class <- predict(rf_model, test_matrix_s18, type="response")
+cm_s1_rf <- confusionMatrix(
+  factor(s1_rf_pred_class),
+  factor(test_label_s1),
+  positive = "1"
+)
+cm_s18_rf <- confusionMatrix(
+  factor(s18_rf_pred_class),
+  factor(test_label_s18),
+  positive = "1"
+)
+cat("Session 1 subset Accuracy (RF):", cm_s1_rf$overall["Accuracy"], "\n")
+cat("Session 18 subset Accuracy (RF):", cm_s18_rf$overall["Accuracy"], "\n")
+roc_s1_rf <- roc(test_label_s1, s1_rf_pred_prob)
+roc_s18_rf <- roc(test_label_s18, s18_rf_pred_prob)
+cat("Session 1 subset AUC (RF):", auc(roc_s1_rf), "\n")
+cat("Session 18 subset AUC (RF):", auc(roc_s1_rf), "\n")
+```
+### Test result
+
+The Random Forest model performed well on Session 1 and Session 18, achieving an accuracy of 92% and 96% and a high AUC of both 0.989, indicating near-perfect classification ability for this session. Compared to the overall model performance (accuracy: 73.62%, AUC: 0.768), this suggests that the model generalizes well to Session 1 but may not maintain the same level of accuracy across all sessions.
+
+
+# Predicting model--SVM model
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# SVM MODEL TRAINING
+library(e1071)
+library(caret)
+library(pROC)
+
+# Convert y to factor for classification
+y_train_factor <- factor(y_train, levels = c(0,1))
+y_test_factor  <- factor(y_test,  levels = c(0,1))
+
+# Train an SVM with RBF kernel
+set.seed(123)
+svm_model <- svm(
+  x = X_train,
+  y = y_train_factor,
+  kernel = "radial",
+  cost = 1,
+  scale = TRUE,
+  probability = TRUE
+)
+
+
+# Generate predictions on the test set
+
+svm_pred_class <- predict(svm_model, X_test, probability = TRUE)
+
+
+
+cm_svm <- confusionMatrix(svm_pred_class, y_test_factor, positive = "1")
+cat("\nConfusion Matrix (SVM on X_test):\n")
+print(cm_svm$table)
+cat("Accuracy:", cm_svm$overall["Accuracy"], "\n")
+
+# For ROC/AUC, we need predicted probabilities for the "1" class
+
+pred_svm_prob <- attr(svm_pred_class, "probabilities")[, "1"]  # get prob of class "1"
+
+roc_svm <- roc(response = y_test, predictor = pred_svm_prob)
+cat("AUC (SVM):", auc(roc_svm), "\n")
+
+plot(roc_svm, main = "SVM ROC on Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+```
+The Support Vector Machine (SVM) model achieved an accuracy of 72.54% and an AUC of 0.692, which is lower than both XGBoost (AUC: 0.785) and Random Forest (AUC: 0.768), indicating that SVM struggles more in distinguishing successful and failed trials.
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+# SVM Testing
+
+# 1) Generate predicted classes (and probabilities) using SVM
+svm_pred_class_s1 <- predict(svm_model, test_matrix_s1, probability = TRUE)
+svm_pred_class_s18 <- predict(svm_model, test_matrix_s18, probability = TRUE)
+# 2) Confusion Matrix
+library(caret)
+cm_s1_svm <- confusionMatrix(
+  data      = svm_pred_class_s1,
+  reference = factor(test_label_s1, levels = c(0,1)),
+  positive  = "1"
+)
+cm_s18_svm <- confusionMatrix(
+  data      = svm_pred_class_s18,
+  reference = factor(test_label_s18, levels = c(0,1)),
+  positive  = "1"
+)
+cat("\nConfusion Matrix (SVM, Session 1):\n")
+print(cm_s1_svm$table)
+cat("\nConfusion Matrix (SVM, Session 18):\n")
+print(cm_s18_svm$table)
+cat("Accuracy (Session 1, SVM):", cm_s1_svm$overall["Accuracy"], "\n")
+cat("Accuracy (Session 18, SVM):", cm_s18_svm$overall["Accuracy"], "\n")
+# 3) AUC
+#    Retrieve predicted probabilities for the positive class ("1")
+library(pROC)
+svm_pred_prob_s1 <- attr(svm_pred_class_s1, "probabilities")[, "1"]
+svm_pred_prob_s18 <- attr(svm_pred_class_s18, "probabilities")[, "1"]
+roc_s1_svm <- roc(response = test_label_s1, predictor = svm_pred_prob_s1)
+roc_s18_svm <- roc(response = test_label_s18, predictor = svm_pred_prob_s18)
+auc_s1_svm <- auc(roc_s1_svm)
+auc_s18_svm <- auc(roc_s18_svm)
+cat("AUC (Session 1, SVM):", auc_s1_svm, "\n")
+
+plot(roc_s1_svm, main = "ROC Curve for SVM on Session 1")
+plot(roc_s18_svm, main = "ROC Curve for SVM on Session 18")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+```
+The SVM model shows mixed performance across sessions, with Session 1 accuracy at 68% and Session 18 accuracy at 78%. The AUC for Session 1 is high (0.917), indicating strong class separation despite low accuracy, so I decide to give up this model.
+# Predicting model-- logistic model
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# LOGISTIC REGRESSION 
+
+
+train_df <- data.frame(X_train)
+train_df$y <- factor(y_train, levels = c(0,1))  # make it a factor for clarity
+
+# 2) Fit logistic regression
+
+logit_model <- glm(
+  formula = y ~ .,
+  data    = train_df,
+  family  = binomial
+)
+summary(logit_model)
+
+# 3) Predictions on test set
+#    Combine X_test and y_test into data frame for convenience
+test_df <- data.frame(X_test)
+test_df$y <- factor(y_test, levels = c(0,1))
+
+#    Generate probabilities of class "1"
+pred_prob_logit <- predict(logit_model, newdata = test_df, type = "response")
+
+#    Convert to class predictions: 0 or 1
+pred_class_logit <- ifelse(pred_prob_logit > 0.5, 1, 0)
+pred_class_logit <- factor(pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix and Accuracy
+cm_logit <- confusionMatrix(
+  data      = pred_class_logit,
+  reference = test_df$y,   # the true label from test_df
+  positive  = "1"
+)
+
+print(cm_logit$table)
+cat("Accuracy:", cm_logit$overall["Accuracy"], "\n")
+
+# 5) ROC and AUC
+roc_logit <- roc(
+  response  = y_test,           # numeric vector (0 or 1)
+  predictor = pred_prob_logit   # predicted probabilities of class "1"
+)
+cat("AUC (Logistic):", auc(roc_logit), "\n")
+
+plot(roc_logit, main = "Logistic Regression ROC on Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+
+```
+The logistic regression model achieved an accuracy of 70.87% and an AUC of 0.690, which is lower than both XGBoost (AUC: 0.785) and Random Forest (AUC: 0.768), indicating weaker classification performance
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Logistic Regression Testing 
+
+
+
+
+# 1) Create a data frame for the Session 1 test
+s1_df <- data.frame(test_matrix_s1)
+s1_df$y <- factor(test_label_s1, levels = c(0,1))
+
+# 2) Predict probabilities
+s1_prob_logit <- predict(logit_model, newdata = s1_df, type = "response")
+
+# 3) Predict classes
+s1_pred_class_logit <- ifelse(s1_prob_logit > 0.5, 1, 0)
+s1_pred_class_logit <- factor(s1_pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix
+cm_s1_logit <- confusionMatrix(
+  data      = s1_pred_class_logit,
+  reference = s1_df$y,
+  positive  = "1"
+)
+cat("Confusion Matrix (Session 1, Logistic):\n")
+print(cm_s1_logit$table)
+cat("Accuracy (Session 1, Logistic):", cm_s1_logit$overall["Accuracy"], "\n")
+
+# 5) AUC
+library(pROC)
+roc_s1_logit <- roc(response = test_label_s1, predictor = s1_prob_logit)
+cat("AUC (Session 1, Logistic):", auc(roc_s1_logit), "\n")
+
+
+plot(roc_s1_logit, main = "Logistic Regression ROC - Session 1")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+
+# 1) Create a data frame for Session 18
+#    test_matrix_s18: the design matrix you built for Session 18
+#    test_label_s18: the ground-truth (0/1) for Session 18
+s18_df <- data.frame(test_matrix_s18)
+s18_df$y <- factor(test_label_s18, levels = c(0,1))
+
+# 2) Predict probabilities using the trained logistic model
+s18_prob_logit <- predict(logit_model, newdata = s18_df, type = "response")
+
+# 3) Convert probabilities to class predictions (0 or 1)
+s18_pred_class_logit <- ifelse(s18_prob_logit > 0.5, 1, 0)
+s18_pred_class_logit <- factor(s18_pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix and Accuracy
+library(caret)
+cm_s18_logit <- confusionMatrix(
+  data      = s18_pred_class_logit,
+  reference = s18_df$y,
+  positive  = "1"
+)
+cat("Confusion Matrix (Session 18, Logistic):\n")
+print(cm_s18_logit$table)
+cat("Accuracy (Session 18, Logistic):", cm_s18_logit$overall["Accuracy"], "\n")
+
+# 5) AUC
+library(pROC)
+roc_s18_logit <- roc(response = test_label_s18, predictor = s18_prob_logit)
+cat("AUC (Session 18, Logistic):", auc(roc_s18_logit), "\n")
+
+
+plot(roc_s18_logit, main = "Logistic Regression ROC - Session 18")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+
+
+```
+The logistic regression model showed moderate performance across both Session 1 (Accuracy: 72%, AUC: 0.772) and Session 18 (Accuracy: 78%, AUC: 0.746), which performs worse than xgboost and random forest.
+
+# Model performance summary:
+Among the four models tested, XGBoost performed the best, achieving the highest accuracy (74.31%) and AUC (0.785), making it the most reliable classifier. Random Forest (73.62% accuracy, 0.768 AUC) was a strong alternative, offering good interpretability but slightly higher false positives. SVM (72.54% accuracy, 0.692 AUC) struggled with false positives and required careful scaling. Logistic Regression (70.87% accuracy, 0.690 AUC) was interpretable but suffered from multicollinearity and poor predictive performance.Therefore, the model I choose to use is Xgboost model and Random forest modle which performs better.
+
+
+# Test Data
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+
+# Step 8: Test Data
+
+set.seed(123)
+
+
+
+summarize_test_bins <- function(test_data, assigned_session_id = 99) {
+  # test_data$spks is a list of spike matrices, one per trial
+  n_trials <- length(test_data$spks)
+  trial_list <- vector("list", n_trials)
+  
+  for (t_i in seq_len(n_trials)) {
+    # 1) Take the spike matrix for trial t_i
+    spikes_mat <- test_data$spks[[t_i]]
+    
+    # 2) Compute colMeans across all neurons for each time bin
+    bin_means <- colMeans(spikes_mat, na.rm = TRUE)
+    names(bin_means) <- paste0("bin", seq_along(bin_means))
+    
+    # 3) Create a 1-row tibble with those bin means
+    out_row <- as_tibble_row(bin_means)
+    
+    # 4) Add the usual columns: trial_id, contrasts, feedback_type (if present)
+    out_row$trial_id       <- t_i
+    out_row$contrast_left  <- test_data$contrast_left[t_i]
+    out_row$contrast_right <- test_data$contrast_right[t_i]
+    out_row$feedback_type  <- test_data$feedback_type[t_i]
+    
+    trial_list[[t_i]] <- out_row
+  }
+  
+  # Combine
+  result_df <- bind_rows(trial_list)
+  
+  # For convenience, add a 'session_id' so it lines up with your model matrix
+  # Choose any integer that won't conflict with your existing 1–18.
+  result_df$session_id <- assigned_session_id
+  
+  # Also add success, contrast_diff if you want to evaluate performance
+  result_df <- result_df %>%
+    mutate(
+      success = if_else(feedback_type == 1, 1, 0),
+      contrast_diff = abs(contrast_left - contrast_right)
+    )
+  
+  result_df
+}
+
+
+# Summarize test1 and test2 in the same bin-based style
+test1_bin_data <- summarize_test_bins(test1, assigned_session_id = 19) 
+test2_bin_data <- summarize_test_bins(test2, assigned_session_id = 20)
+
+
+
+
+# Build the model matrix for test1_bin_data.
+# The vector of time-bin columns:
+time_bin_cols <- grep("^bin", names(test1_bin_data), value = TRUE)
+
+extra_predictors <- c("session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff")
+
+# Combine them
+all_predictor_cols <- c(extra_predictors, time_bin_cols)
+
+# Model matrix for test1
+test1_mat <- model.matrix(~ ., data = test1_bin_data[, all_predictor_cols])
+
+# Model matrix for test2
+test2_mat <- model.matrix(~ ., data = test2_bin_data[, all_predictor_cols])
+
+# If test data has feedback_type, we can measure accuracy/AUC
+test1_label <- test1_bin_data$success
+test2_label <- test2_bin_data$success
+
+
+### XGBOOST PREDICTION ON test1 / test2
+
+
+# 1) Predict probabilities and classes using your trained XGBoost model
+pred_prob_test1 <- predict(xgb_model_improved, newdata = test1_mat)
+pred_class_test1 <- ifelse(pred_prob_test1 > 0.5, 1, 0)
+
+# 2) Confusion Matrix & AUC
+cat("Confusion Matrix (XGB) for test1:\n")
+cm_test1 <- confusionMatrix(
+  factor(pred_class_test1),
+  factor(test1_label),
+  positive = "1"
+)
+print(cm_test1$table)
+cat("Accuracy (test1):", cm_test1$overall["Accuracy"], "\n")
+
+roc_test1 <- roc(response = test1_label, predictor = pred_prob_test1)
+cat("AUC (test1):", auc(roc_test1), "\n")
+
+
+cat("\n=== XGBoost prediction on test2 ===\n")
+pred_prob_test2 <- predict(xgb_model_improved, newdata = test2_mat)
+pred_class_test2 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cat("Confusion Matrix (XGB) for test2:\n")
+cm_test2 <- confusionMatrix(
+  factor(pred_class_test2),
+  factor(test2_label),
+  positive = "1"
+)
+print(cm_test2$table)
+cat("Accuracy (test2):", cm_test2$overall["Accuracy"], "\n")
+
+roc_test2 <- roc(response = test2_label, predictor = pred_prob_test2)
+cat("AUC (test2):", auc(roc_test2), "\n")
+
+
+### RANDOM FOREST PREDICTION ON test1 / test2
+
+
+pred_rf_prob_test1  <- predict(rf_model, test1_mat, type="prob")[,2]
+pred_rf_class_test1 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cm_test1_rf <- confusionMatrix(
+  factor(pred_rf_class_test1),
+  factor(test1_label),
+  positive = "1"
+)
+cat("Accuracy (RF) on test1:", cm_test1_rf$overall["Accuracy"], "\n")
+
+roc_test1_rf <- roc(test1_label, pred_rf_prob_test1)
+cat("AUC (RF) on test1:", auc(roc_test1_rf), "\n")
+
+
+cat("\n=== Random Forest prediction on test2 ===\n")
+pred_rf_prob_test2  <- predict(rf_model, test2_mat, type="prob")[,2]
+pred_rf_class_test2 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cm_test2_rf <- confusionMatrix(
+  factor(pred_rf_class_test2),
+  factor(test2_label),
+  positive = "1"
+)
+cat("Accuracy (RF) on test2:", cm_test2_rf$overall["Accuracy"], "\n")
+
+roc_test2_rf <- roc(test2_label, pred_rf_prob_test2)
+cat("AUC (RF) on test2:", auc(roc_test2_rf), "\n")
+
+
+```
+
+The models were tested on newly released data (test1 & test2), and both XGBoost and Random perform weaker than before,with accuracy around 71-74%,and AUC.
+
+
+# Discussion
+This study compared four models—XGBoost, Random Forest, SVM, and Logistic Regression—for trial success prediction. XGBoost performed best, followed by Random Forest, while SVM and Logistic Regression underperformed. Key predictors included contrast difference, session ID, and trial ID, with some time-bin features showing relevance.
+
+
+The model was tested on 50 randomly selected trials from Session 1, the model performed exceptionally well on Session 1, achieving an accuracy of 94% and an AUC of 0.97, indicating strong classification ability. And The Random Forest model performed excellent on Session 1 and Session 18, achieving an accuracy of 92% and 96% and a high AUC of both 0.989, indicating near-perfect classification ability for this session.Test data accuracy is up to 74%, with AUC up to 0.71, likely due to data distribution shifts, class imbalance, and model overfitting to training sessions. Models rarely predicted failures, indicating a classification bias.
+
+Future Improvements
+Analyze test data distribution and adapt models accordingly.
+Optimize decision thresholds to reduce false positives.
+Feature selection and regularization to improve generalization.
+Use ensemble methods (XGBoost + RF) for robustness.
+Conclusion: While XGBoost remains the best model, further tuning is needed for better generalization to new data.
+
+# Appendix
+
+```{r appendix_code, echo=TRUE, eval=FALSE}
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(xgboost)
+library(randomForest)
+library(pROC)
+library(readr)
+
+# Step 1: Load Data
+# (A) Read the 18 session data into a list
+session_list <- vector("list", length = 18)
+for (sid in seq_len(18)) {
+  file_path <- paste0("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\session", sid, ".rds")
+  session_list[[sid]] <- readRDS(file_path)
+
+cat("Session", sid, "loaded from:", file_path, "\n")
+}
+
+
+# (B) Read test data (test1.rds and test2.rds)
+test1 <- readRDS("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\test1.rds") 
+test2 <- readRDS("C:\\Users\\csz20\\OneDrive\\Desktop\\STA 141A project\\sessions\\test2.rds")
+session <- session_list
+
+# Step 2: Data Exploration (EDA) of Session 7
+
+
+dims_trial12 <- dim(session[[7]]$spks[[12]])
+cat("Number of neurons x Number of time bins:", dims_trial12, "\n")
+
+
+areas_s7 <- session[[7]]$brain_area
+unique_areas_s7 <- unique(areas_s7)
+cat("Total number of brain regions:", length(unique_areas_s7), "\n")
+cat("List of brain regions:\n")
+print(unique_areas_s7)
+
+feedback_s7 <- session[[7]]$feedback_type
+cat("Total number of trials:", length(feedback_s7), "\n")
+cat("Successful trials (1):", sum(feedback_s7 == 1), "\n")
+cat("Failed trials (-1):", sum(feedback_s7 == -1), "\n")
+cat("Success rate in session 7:", mean(feedback_s7 == 1), "\n")
+
+# Calculate overall success rate across all 18 sessions
+acc_success_count <- 0
+acc_trial_count   <- 0
+for(sid in seq_along(session)) {
+  current_feedback <- session[[sid]]$feedback_type
+  acc_success_count <- acc_success_count + sum(current_feedback == 1)
+  acc_trial_count   <- acc_trial_count + length(current_feedback)
+}
+overall_success_rate <- acc_success_count / acc_trial_count
+
+
+#  Example: Display part of the spike matrix for session 7, trial 12
+example_spk_7 <- session[[7]]$spks[[12]][1:5, 1:8]
+print(example_spk_7)
+#  Plot histogram of total spike counts per neuron in trial 12
+spike_sums_trial12 <- rowSums(session[[7]]$spks[[12]])
+hist(
+  spike_sums_trial12,
+  main = "Histogram of Total Spike Counts per Neuron (Trial 12, Session 7)",
+  xlab = "Total Spikes per Neuron"
+)
+
+
+# Step 3: Data integration
+
+
+# Summarize a single trial:
+#     - For each brain region, compute sum of spikes, number of neurons, mean spikes
+#     - Include trial-specific info (contrast, feedback, etc.)
+single_trial_info <- function(sess_idx, trial_idx) {
+  spikes_mat <- session[[sess_idx]]$spks[[trial_idx]]
+  if (any(is.na(spikes_mat))) {
+    message("Warning: Missing values in session[[", sess_idx, "]] trial ", trial_idx)
+  }
+  
+  # Summation by region
+  region_vec <- session[[sess_idx]]$brain_area
+  spike_sums <- rowSums(spikes_mat)
+  
+  # Create a data frame grouped by brain regions
+  df <- tibble(
+    region_label = region_vec,
+    total_spikes = spike_sums
+  ) %>%
+    group_by(region_label) %>%
+    summarize(
+      region_sum = sum(total_spikes),
+      neuron_count = n(),
+      region_mean = mean(total_spikes)
+    ) %>%
+    ungroup()
+  
+  # Append trial-level info
+  df$trial_id       <- trial_idx
+  df$contrast_left  <- session[[sess_idx]]$contrast_left[trial_idx]
+  df$contrast_right <- session[[sess_idx]]$contrast_right[trial_idx]
+  df$feedback_type  <- session[[sess_idx]]$feedback_type[trial_idx]
+  
+  # Return the result
+  df
+}
+
+
+# Aggregate a whole session's trials
+summarize_session <- function(sess_idx) {
+  n_trials <- length(session[[sess_idx]]$spks)
+  all_data <- vector("list", n_trials)
+  
+  for (tid in seq_len(n_trials)) {
+    all_data[[tid]] <- single_trial_info(sess_idx, tid)
+  }
+  
+  # Merge them row-wise
+  combined_df <- bind_rows(all_data)
+  
+  # Attach session-level fields
+  combined_df$mouse_name <- session[[sess_idx]]$mouse_name
+  combined_df$date_exp   <- session[[sess_idx]]$date_exp
+  combined_df$session_id <- sess_idx
+  
+  combined_df
+}
+
+
+# (C) Build the final data set across all sessions
+full_session_list <- vector("list", 18)
+for (sid in 1:18) {
+  full_session_list[[sid]] <- summarize_session(sid)
+}
+all_session_data <- bind_rows(full_session_list)
+
+# Create additional columns for analysis
+# - success indicator: 1 if feedback == 1, else 0
+# - absolute difference in left/right contrast
+all_session_data <- all_session_data %>%
+  mutate(
+    success = if_else(feedback_type == 1, 1, 0),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+
+cat("Dimensions of all_session_data:", dim(all_session_data), "\n")
+
+
+# (D) Create functional-like data: 
+#     Each trial => average across neurons for each of the 40 time bins
+per_trial_bin_averages <- function(sess_idx, trial_idx) {
+  spikes_mat <- session[[sess_idx]]$spks[[trial_idx]]
+  
+  # Each column is a time bin; compute average across all neurons for each bin
+  bin_means <- colMeans(spikes_mat, na.rm = TRUE)
+  
+  # Give each bin a name to avoid the error
+  names(bin_means) <- paste0("bin", seq_along(bin_means))
+  
+  # Turn it into a single-row tibble
+  out_row <- as_tibble_row(bin_means)
+  
+  # Add relevant trial info
+  out_row$trial_id       <- trial_idx
+  out_row$contrast_left  <- session[[sess_idx]]$contrast_left[trial_idx]
+  out_row$contrast_right <- session[[sess_idx]]$contrast_right[trial_idx]
+  out_row$feedback_type  <- session[[sess_idx]]$feedback_type[trial_idx]
+  return(out_row)
+}
+
+
+summarize_session_bins <- function(sess_idx) {
+  n_trials <- length(session[[sess_idx]]$spks)
+  trial_list <- vector("list", n_trials)
+  
+  for (tid in seq_len(n_trials)) {
+    trial_list[[tid]] <- per_trial_bin_averages(sess_idx, tid)
+  }
+  
+  # Combine rows
+  result_df <- bind_rows(trial_list)
+  
+  # Attach session-level info
+  result_df$mouse_name <- session[[sess_idx]]$mouse_name
+  result_df$date_exp   <- session[[sess_idx]]$date_exp
+  result_df$session_id <- sess_idx
+  result_df
+}
+
+# Build a combined table for bin-based data
+bin_data_list <- vector("list", 18)
+for (sid in 1:18) {
+  bin_data_list[[sid]] <- summarize_session_bins(sid)
+}
+all_bin_data <- bind_rows(bin_data_list)
+
+# Add success indicator & contrast difference for the bin-based data as well
+all_bin_data <- all_bin_data %>%
+  mutate(
+    success = if_else(feedback_type == 1, 1, 0),
+    contrast_diff = abs(contrast_left - contrast_right)
+  )
+
+# (E) Quick check on the newly created data
+
+print(head(all_session_data, 6))
+
+# Step 4: more Visualizations / EDA after data integration
+
+
+# 1) Visualize how success rates change over trials
+#    We create trial "bins" and then compute the average success rate within each bin.
+
+# (a) Define trial groups (e.g., groups of 25 trials each)
+all_session_data$trial_bin <- cut(
+  all_session_data$trial_id,
+  breaks = seq(0, max(all_session_data$trial_id), by = 25),
+  include.lowest = TRUE
+)
+
+# Rename factor levels (optional, if we want to remove bracket-like text)
+levels(all_session_data$trial_bin) <- seq(25, length.out = length(levels(all_session_data$trial_bin)), by = 25)
+
+# (b) Aggregate success rate within each session & trial_bin
+grouped_success <- all_session_data %>%
+  group_by(session_id, trial_bin) %>%
+  summarize(success_rate = mean(success), .groups = "drop")
+
+# (c) Plot a bar chart of success rate for each session, faceted by session_id
+ggplot(grouped_success, aes(x = trial_bin, y = success_rate)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ session_id, ncol = 5) +
+  theme_minimal() +
+  labs(
+    title = "Success Rate Across Sessions by Trial Group",
+    x = "Trial Group (bins of 25 trials)",
+    y = "Success Rate"
+  )
+# 2) Visualize overall spike trends over trial_id
+#    Here we can use all_session_data or all_bin_data to show how average spikes vary.
+cat("\n=== Plotting average spike counts by trial ===\n")
+
+# For region-level data:
+avg_spike_df <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(mean_spike_region = sum(region_sum) / sum(neuron_count), .groups = "drop")
+
+# (a) A line chart of mean_spike_region vs trial_id, using LOESS smoothing
+ggplot(avg_spike_df, aes(x = trial_id, y = mean_spike_region)) +
+  geom_line() +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  facet_wrap(~ session_id, ncol = 5) +
+  labs(
+    title = "Average Spike Rate by Trial",
+    x = "Trial ID",
+    y = "Mean Spike Rate (region-level)"
+  ) +
+  theme_bw()
+
+# Additional EDA: Distribution of Success/Failure per Session
+# 1) Summarize the success/failure in each session
+
+trial_level <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(success = first(success), .groups="drop")
+
+# 2) Count successes/failures for each session
+success_counts <- trial_level %>%
+  group_by(session_id, success) %>%
+  summarize(n = n(), .groups="drop")
+
+# 3) Make a bar chart
+ggplot(success_counts, aes(x = factor(session_id), y = n, fill = factor(success))) +
+  geom_col(position = "dodge") +
+  labs(
+    title = "Success/Failure Count per Session",
+    x = "Session ID",
+    y = "Count of Trials",
+    fill = "Success"
+  ) +
+  theme_minimal()
+
+# Boxplot
+# 1) Build the data frame (total_spikes per neuron)
+spike_summaries_s7 <- lapply(seq_along(session[[7]]$spks), function(trial_i) {
+  spk_mat <- session[[7]]$spks[[trial_i]]
+  neuron_sums <- rowSums(spk_mat, na.rm = TRUE)
+  data.frame(
+    neuron_id    = seq_along(neuron_sums),
+    brain_region = session[[7]]$brain_area,
+    total_spikes = neuron_sums,
+    trial_id     = trial_i
+  )
+}) %>%
+  bind_rows()
+
+# 2) Plot
+ggplot(spike_summaries_s7, aes(x = brain_region, y = total_spikes)) +
+  # Boxplot with outliers hidden so they don't get double-drawn
+  geom_boxplot(outlier.shape = NA) +
+  # Jitter layer for actual points
+  geom_jitter(width = 0.03, alpha = 0.1, color = "gray") +
+  # Zoom in on 0–10 so the box and points are visible
+  coord_cartesian(ylim = c(0, 10)) +
+  labs(
+    title = "Distribution of Total Spikes by Brain Region (Session 7)",
+    x = "Brain Region",
+    y = "Total Spikes (sum across time bins per neuron)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# Additional EDA: Histogram of Spike Sums Per Trial
+
+trial_spike_totals <- all_session_data %>%
+  group_by(session_id, trial_id) %>%
+  summarize(total_spikes_trial = sum(region_sum), .groups="drop")
+
+# Plot a histogram of total_spikes_trial
+ggplot(trial_spike_totals, aes(x = total_spikes_trial)) +
+  geom_histogram(binwidth = 50,color="white") +
+  labs(
+    title = "Histogram of Total Spikes per Trial (All Sessions)",
+    x = "Total Spikes in Trial",
+    y = "Count of Trials"
+  ) +
+  theme_minimal()
+# 3) PCA on the bin-based data 
+cat("\n=== Performing PCA on time-bin features and plotting results ===\n")
+
+# (a) Extract only the columns corresponding to the 40 time bins
+bin_columns <- names(all_bin_data)[grepl("^bin", names(all_bin_data))]
+features <- all_bin_data[, bin_columns]
+
+# (b) Scale and do PCA
+scaled_features <- scale(features)
+pca_fit <- prcomp(scaled_features, center = FALSE, scale. = FALSE)
+
+# (c) Create a data frame for the first two principal components
+pca_results <- data.frame(
+  PC1 = pca_fit$x[, 1],
+  PC2 = pca_fit$x[, 2],
+  session_id = all_bin_data$session_id,
+  mouse_name = all_bin_data$mouse_name
+)
+
+# (d) Plot PC1 vs PC2, colored by session_id
+ggplot(pca_results, aes(x = PC1, y = PC2, color = factor(session_id))) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "PCA of Bin-based Spike Averages (PC1 vs PC2)",
+    x = "PC1",
+    y = "PC2",
+    color = "Session ID"
+  )
+ggplot(pca_results, aes(PC1, PC2, color = mouse_name)) + geom_point()+theme_minimal() +
+  labs(
+    title = "PCA of Bin-based Spike Averages (PC1 vs PC2)",
+    x = "PC1",
+    y = "PC2",
+    color = "Session ID"
+  )
+
+cat("\nVisualizations complete.\n")
+# Step 5: Prepare Data for Modeling
+
+
+# Identify time-bin columns
+time_bin_cols <- grep("^bin", names(all_bin_data), value = TRUE)
+
+# Define a vector of columns to keep in addition to bins
+extra_predictors <- c( "session_id","trial_id" ,"contrast_left", "contrast_right", "contrast_diff")
+all_predictor_cols <- c(extra_predictors, time_bin_cols)
+
+# Extract the data subset
+predictor_data <- all_bin_data[, all_predictor_cols]
+
+
+label <- all_bin_data$success
+
+
+#     Convert categorical features to dummy variables automatically
+X <- model.matrix(~ . , data = predictor_data)
+
+
+cat("Design matrix X built with dimensions:", dim(X), "\n")
+
+set.seed(123)  # For reproducibility
+train_index <- createDataPartition(label, p = 0.80, list = FALSE)
+
+X_train <- X[train_index, ]
+X_test  <- X[-train_index, ]
+y_train <- label[train_index]
+y_test  <- label[-train_index]
+
+cat("Training set size:", nrow(X_train), "Testing set size:", nrow(X_test), "\n")
+
+cat("Success rate in training:", mean(y_train), "\n")
+cat("Success rate in testing:",  mean(y_test), "\n")
+#Step 6:predictive modeling
+# Improved XGBoost Training with Tuned Params
+
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+
+params_improved <- list(
+  objective = "binary:logistic", # logistic regression for binary classification
+  eval_metric = "logloss",       
+  eta = 0.035,                    # smaller step size (learning rate)
+  max_depth = 8,                 # deeper trees can learn more complex patterns
+  subsample = 0.8,               # sample 80% of rows for each tree
+  colsample_bytree = 0.8,        # sample 80% of features for each tree
+  min_child_weight = 5           # minimum sum of instance weight (avoid overfitting)
+)
+
+set.seed(123)
+xgb_model_improved <- xgb.train(
+  params = params_improved,
+  data = dtrain,
+  nrounds = 300,                #  train rounds
+  watchlist = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 10,   # stop if no improvement after 20 rounds
+  print_every_n = 50            # reduce consoe output frequency
+)
+
+# Generate predictions on test set
+pred_prob_improved <- predict(xgb_model_improved, newdata = X_test)
+pred_class_improved <- ifelse(pred_prob_improved > 0.5, 1, 0)
+
+# Evaluate
+cm_improved <- confusionMatrix(
+  factor(pred_class_improved),
+  factor(y_test),
+  positive = "1"
+)
+
+print(cm_improved$table)
+cat("Accuracy:", cm_improved$overall["Accuracy"], "\n")
+
+roc_obj_improved <- roc(response = y_test, predictor = pred_prob_improved)
+auc_improved <- auc(roc_obj_improved)
+cat("AUC:", auc_improved, "\n")
+# Step 7: Test on a Specific Session and test by session 1 and session 18
+
+
+# (A) Identify the rows in all_bin_data that correspond to session 1
+session_1_rows <- which(all_bin_data$session_id == 1)
+
+
+set.seed(111)
+test_index_s1 <- sample(session_1_rows, 50, replace = FALSE)
+
+# (B) Build the test data for these 50 trials
+test_data_s1 <- all_bin_data[test_index_s1, ]
+
+
+test_label_s1 <- test_data_s1$success
+
+predictor_cols_s1 <- c(
+  "session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff",
+  grep("^bin", names(test_data_s1), value = TRUE)
+)
+test_matrix_s1 <- model.matrix(~ ., data = test_data_s1[, predictor_cols_s1])
+
+# (C) Generate predictions using the previously trained XGBoost model
+s1_pred_prob <- predict(xgb_model_improved, newdata = test_matrix_s1)
+s1_pred_class <- ifelse(s1_pred_prob > 0.5, 1, 0)
+
+# (D) Evaluate performance on these 50 trials
+
+
+
+cm_s1 <- confusionMatrix(
+  factor(s1_pred_class),
+  factor(test_label_s1),
+  positive = "1"
+)
+print(cm_s1$table)
+cat("Accuracy on Session 1 subset:", cm_s1$overall["Accuracy"], "\n")
+
+# (E) ROC and AUC
+roc_s1 <- roc(response = test_label_s1, predictor = s1_pred_prob)
+auc_s1 <- auc(roc_s1)
+cat("AUC for Session 1 subset:", auc_s1, "\n")
+
+plot(roc_s1, main = "ROC Curve for Session 1 Subset")
+abline(a = 0, b = 1, col = "red", lty = 2)
+# Testing on Session 18
+
+
+# (A) Identify rows in 'all_bin_data' that correspond to session 18
+session_18_rows <- which(all_bin_data$session_id == 18)
+
+set.seed(111)  # Different seed from earlier to avoid overlap
+test_index_s18 <- sample(session_18_rows, 50, replace = FALSE)
+
+# (B) Build a test subset for these 50 trials
+test_data_s18 <- all_bin_data[test_index_s18, ]
+test_label_s18 <- test_data_s18$success
+
+# (C) Prepare the feature matrix using the same columns as the trained model
+predictor_cols_s18 <- c(
+  "session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff",
+  grep("^bin", names(test_data_s18), value = TRUE)
+)
+test_matrix_s18 <- model.matrix(~ ., data = test_data_s18[, predictor_cols_s18])
+
+# (D) Generate predictions using the previously trained XGBoost model
+s18_pred_prob  <- predict(xgb_model_improved, newdata = test_matrix_s18)
+s18_pred_class <- ifelse(s18_pred_prob > 0.5, 1, 0)
+
+# (E) Evaluate model performance on these 50 trials
+
+cm_s18 <- confusionMatrix(
+  factor(s18_pred_class),
+  factor(test_label_s18),
+  positive = "1"
+)
+print(cm_s18$table)
+cat("Accuracy on Session 18 subset:", cm_s18$overall["Accuracy"], "\n")
+
+# (F) ROC and AUC
+roc_s18 <- roc(response = test_label_s18, predictor = s18_pred_prob)
+auc_s18 <- auc(roc_s18)
+cat("AUC for Session 18 subset:", auc_s18, "\n")
+
+# Plot ROC
+plot(roc_s18, main = "ROC Curve for Session 18 Subset")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+# Random Forest via randomForest Package
+
+# Convert y_train / y_test to factors (randomForest factor label)
+y_train_factor <- factor(y_train, levels = c(0,1))
+y_test_factor  <- factor(y_test, levels = c(0,1))
+
+# 1) Train the random forest
+set.seed(123)
+rf_model <- randomForest(
+  x = X_train,
+  y = y_train_factor,
+  ntree = 900,       # number of trees
+  mtry = 20,         # how many features randomly chosen at each split
+  importance = TRUE  # if you want variable importance
+)
+
+
+# 2) Predictions on the test set
+pred_rf_prob <- predict(rf_model, X_test, type = "prob")[, 2]
+pred_rf_class <- predict(rf_model, X_test, type = "response")
+
+# 3) Confusion Matrix + Accuracy
+cm_rf <- confusionMatrix(pred_rf_class, y_test_factor, positive = "1")
+cat("\nConfusion Matrix (RandomForest):\n")
+print(cm_rf$table)
+cat("Accuracy:", cm_rf$overall["Accuracy"], "\n")
+
+# 4) ROC & AUC
+roc_rf <- roc(
+  response  = y_test,      # still numeric 0 or 1
+  predictor = pred_rf_prob
+)
+cat("AUC:", auc(roc_rf), "\n")
+
+plot(roc_rf, main = "Random Forest ROC")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+cat("\nTop variables by importance:\n")
+importance(rf_model) |> head()
+s1_rf_pred_prob  <- predict(rf_model, test_matrix_s1, type="prob")[,2]
+s1_rf_pred_class <- predict(rf_model, test_matrix_s1, type="response")
+s18_rf_pred_prob  <- predict(rf_model, test_matrix_s18, type="prob")[,2]
+s18_rf_pred_class <- predict(rf_model, test_matrix_s18, type="response")
+cm_s1_rf <- confusionMatrix(
+  factor(s1_rf_pred_class),
+  factor(test_label_s1),
+  positive = "1"
+)
+cm_s18_rf <- confusionMatrix(
+  factor(s18_rf_pred_class),
+  factor(test_label_s18),
+  positive = "1"
+)
+cat("Session 1 subset Accuracy (RF):", cm_s1_rf$overall["Accuracy"], "\n")
+cat("Session 18 subset Accuracy (RF):", cm_s18_rf$overall["Accuracy"], "\n")
+roc_s1_rf <- roc(test_label_s1, s1_rf_pred_prob)
+roc_s18_rf <- roc(test_label_s18, s18_rf_pred_prob)
+cat("Session 1 subset AUC (RF):", auc(roc_s1_rf), "\n")
+cat("Session 18 subset AUC (RF):", auc(roc_s1_rf), "\n")
+# SVM MODEL TRAINING
+library(e1071)
+library(caret)
+library(pROC)
+
+# Convert y to factor for classification
+y_train_factor <- factor(y_train, levels = c(0,1))
+y_test_factor  <- factor(y_test,  levels = c(0,1))
+
+# Train an SVM with RBF kernel
+set.seed(123)
+svm_model <- svm(
+  x = X_train,
+  y = y_train_factor,
+  kernel = "radial",
+  cost = 1,
+  scale = TRUE,
+  probability = TRUE
+)
+
+
+# Generate predictions on the test set
+
+svm_pred_class <- predict(svm_model, X_test, probability = TRUE)
+
+
+
+cm_svm <- confusionMatrix(svm_pred_class, y_test_factor, positive = "1")
+cat("\nConfusion Matrix (SVM on X_test):\n")
+print(cm_svm$table)
+cat("Accuracy:", cm_svm$overall["Accuracy"], "\n")
+
+# For ROC/AUC, we need predicted probabilities for the "1" class
+
+pred_svm_prob <- attr(svm_pred_class, "probabilities")[, "1"]  # get prob of class "1"
+
+roc_svm <- roc(response = y_test, predictor = pred_svm_prob)
+cat("AUC (SVM):", auc(roc_svm), "\n")
+
+plot(roc_svm, main = "SVM ROC on Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# SVM Testing on Session 1
+
+# 1) Generate predicted classes (and probabilities) using SVM
+svm_pred_class_s1 <- predict(svm_model, test_matrix_s1, probability = TRUE)
+svm_pred_class_s18 <- predict(svm_model, test_matrix_s18, probability = TRUE)
+# 2) Confusion Matrix
+library(caret)
+cm_s1_svm <- confusionMatrix(
+  data      = svm_pred_class_s1,
+  reference = factor(test_label_s1, levels = c(0,1)),
+  positive  = "1"
+)
+cm_s18_svm <- confusionMatrix(
+  data      = svm_pred_class_s18,
+  reference = factor(test_label_s18, levels = c(0,1)),
+  positive  = "1"
+)
+cat("\nConfusion Matrix (SVM, Session 1):\n")
+print(cm_s1_svm$table)
+cat("\nConfusion Matrix (SVM, Session 18):\n")
+print(cm_s18_svm$table)
+cat("Accuracy (Session 1, SVM):", cm_s1_svm$overall["Accuracy"], "\n")
+cat("Accuracy (Session 18, SVM):", cm_s18_svm$overall["Accuracy"], "\n")
+# 3) AUC
+#    Retrieve predicted probabilities for the positive class ("1")
+library(pROC)
+svm_pred_prob_s1 <- attr(svm_pred_class_s1, "probabilities")[, "1"]
+svm_pred_prob_s18 <- attr(svm_pred_class_s18, "probabilities")[, "1"]
+roc_s1_svm <- roc(response = test_label_s1, predictor = svm_pred_prob_s1)
+roc_s18_svm <- roc(response = test_label_s18, predictor = svm_pred_prob_s18)
+auc_s1_svm <- auc(roc_s1_svm)
+auc_s18_svm <- auc(roc_s18_svm)
+cat("AUC (Session 1, SVM):", auc_s1_svm, "\n")
+
+plot(roc_s1_svm, main = "ROC Curve for SVM on Session 1")
+plot(roc_s18_svm, main = "ROC Curve for SVM on Session 18")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+# SVM Testing
+
+# 1) Generate predicted classes (and probabilities) using SVM
+svm_pred_class_s1 <- predict(svm_model, test_matrix_s1, probability = TRUE)
+svm_pred_class_s18 <- predict(svm_model, test_matrix_s18, probability = TRUE)
+# 2) Confusion Matrix
+library(caret)
+cm_s1_svm <- confusionMatrix(
+  data      = svm_pred_class_s1,
+  reference = factor(test_label_s1, levels = c(0,1)),
+  positive  = "1"
+)
+cm_s18_svm <- confusionMatrix(
+  data      = svm_pred_class_s18,
+  reference = factor(test_label_s18, levels = c(0,1)),
+  positive  = "1"
+)
+cat("\nConfusion Matrix (SVM, Session 1):\n")
+print(cm_s1_svm$table)
+cat("\nConfusion Matrix (SVM, Session 18):\n")
+print(cm_s18_svm$table)
+cat("Accuracy (Session 1, SVM):", cm_s1_svm$overall["Accuracy"], "\n")
+cat("Accuracy (Session 18, SVM):", cm_s18_svm$overall["Accuracy"], "\n")
+# 3) AUC
+#    Retrieve predicted probabilities for the positive class ("1")
+library(pROC)
+svm_pred_prob_s1 <- attr(svm_pred_class_s1, "probabilities")[, "1"]
+svm_pred_prob_s18 <- attr(svm_pred_class_s18, "probabilities")[, "1"]
+roc_s1_svm <- roc(response = test_label_s1, predictor = svm_pred_prob_s1)
+roc_s18_svm <- roc(response = test_label_s18, predictor = svm_pred_prob_s18)
+auc_s1_svm <- auc(roc_s1_svm)
+auc_s18_svm <- auc(roc_s18_svm)
+cat("AUC (Session 1, SVM):", auc_s1_svm, "\n")
+
+plot(roc_s1_svm, main = "ROC Curve for SVM on Session 1")
+plot(roc_s18_svm, main = "ROC Curve for SVM on Session 18")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+# LOGISTIC REGRESSION 
+
+
+train_df <- data.frame(X_train)
+train_df$y <- factor(y_train, levels = c(0,1))  # make it a factor for clarity
+
+# 2) Fit logistic regression
+
+logit_model <- glm(
+  formula = y ~ .,
+  data    = train_df,
+  family  = binomial
+)
+summary(logit_model)
+
+# 3) Predictions on test set
+#    Combine X_test and y_test into data frame for convenience
+test_df <- data.frame(X_test)
+test_df$y <- factor(y_test, levels = c(0,1))
+
+#    Generate probabilities of class "1"
+pred_prob_logit <- predict(logit_model, newdata = test_df, type = "response")
+
+#    Convert to class predictions: 0 or 1
+pred_class_logit <- ifelse(pred_prob_logit > 0.5, 1, 0)
+pred_class_logit <- factor(pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix and Accuracy
+cm_logit <- confusionMatrix(
+  data      = pred_class_logit,
+  reference = test_df$y,   # the true label from test_df
+  positive  = "1"
+)
+
+print(cm_logit$table)
+cat("Accuracy:", cm_logit$overall["Accuracy"], "\n")
+
+# 5) ROC and AUC
+roc_logit <- roc(
+  response  = y_test,           # numeric vector (0 or 1)
+  predictor = pred_prob_logit   # predicted probabilities of class "1"
+)
+cat("AUC (Logistic):", auc(roc_logit), "\n")
+
+plot(roc_logit, main = "Logistic Regression ROC on Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+# Logistic Regression Testing 
+
+
+
+
+# 1) Create a data frame for the Session 1 test
+s1_df <- data.frame(test_matrix_s1)
+s1_df$y <- factor(test_label_s1, levels = c(0,1))
+
+# 2) Predict probabilities
+s1_prob_logit <- predict(logit_model, newdata = s1_df, type = "response")
+
+# 3) Predict classes
+s1_pred_class_logit <- ifelse(s1_prob_logit > 0.5, 1, 0)
+s1_pred_class_logit <- factor(s1_pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix
+cm_s1_logit <- confusionMatrix(
+  data      = s1_pred_class_logit,
+  reference = s1_df$y,
+  positive  = "1"
+)
+cat("Confusion Matrix (Session 1, Logistic):\n")
+print(cm_s1_logit$table)
+cat("Accuracy (Session 1, Logistic):", cm_s1_logit$overall["Accuracy"], "\n")
+
+# 5) AUC
+library(pROC)
+roc_s1_logit <- roc(response = test_label_s1, predictor = s1_prob_logit)
+cat("AUC (Session 1, Logistic):", auc(roc_s1_logit), "\n")
+
+
+plot(roc_s1_logit, main = "Logistic Regression ROC - Session 1")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+
+
+# 1) Create a data frame for Session 18
+#    test_matrix_s18: the design matrix you built for Session 18
+#    test_label_s18: the ground-truth (0/1) for Session 18
+s18_df <- data.frame(test_matrix_s18)
+s18_df$y <- factor(test_label_s18, levels = c(0,1))
+
+# 2) Predict probabilities using the trained logistic model
+s18_prob_logit <- predict(logit_model, newdata = s18_df, type = "response")
+
+# 3) Convert probabilities to class predictions (0 or 1)
+s18_pred_class_logit <- ifelse(s18_prob_logit > 0.5, 1, 0)
+s18_pred_class_logit <- factor(s18_pred_class_logit, levels = c(0,1))
+
+# 4) Confusion Matrix and Accuracy
+library(caret)
+cm_s18_logit <- confusionMatrix(
+  data      = s18_pred_class_logit,
+  reference = s18_df$y,
+  positive  = "1"
+)
+cat("Confusion Matrix (Session 18, Logistic):\n")
+print(cm_s18_logit$table)
+cat("Accuracy (Session 18, Logistic):", cm_s18_logit$overall["Accuracy"], "\n")
+
+# 5) AUC
+library(pROC)
+roc_s18_logit <- roc(response = test_label_s18, predictor = s18_prob_logit)
+cat("AUC (Session 18, Logistic):", auc(roc_s18_logit), "\n")
+
+
+plot(roc_s18_logit, main = "Logistic Regression ROC - Session 18")
+abline(a = 0, b = 1, col = "gray", lty = 2)
+# Step 8: Test Data
+
+set.seed(123)
+
+
+
+summarize_test_bins <- function(test_data, assigned_session_id = 99) {
+  # test_data$spks is a list of spike matrices, one per trial
+  n_trials <- length(test_data$spks)
+  trial_list <- vector("list", n_trials)
+  
+  for (t_i in seq_len(n_trials)) {
+    # 1) Take the spike matrix for trial t_i
+    spikes_mat <- test_data$spks[[t_i]]
+    
+    # 2) Compute colMeans across all neurons for each time bin
+    bin_means <- colMeans(spikes_mat, na.rm = TRUE)
+    names(bin_means) <- paste0("bin", seq_along(bin_means))
+    
+    # 3) Create a 1-row tibble with those bin means
+    out_row <- as_tibble_row(bin_means)
+    
+    # 4) Add the usual columns: trial_id, contrasts, feedback_type (if present)
+    out_row$trial_id       <- t_i
+    out_row$contrast_left  <- test_data$contrast_left[t_i]
+    out_row$contrast_right <- test_data$contrast_right[t_i]
+    out_row$feedback_type  <- test_data$feedback_type[t_i]
+    
+    trial_list[[t_i]] <- out_row
+  }
+  
+  # Combine
+  result_df <- bind_rows(trial_list)
+  
+  # For convenience, add a 'session_id' so it lines up with your model matrix
+  # Choose any integer that won't conflict with your existing 1–18.
+  result_df$session_id <- assigned_session_id
+  
+  # Also add success, contrast_diff if you want to evaluate performance
+  result_df <- result_df %>%
+    mutate(
+      success = if_else(feedback_type == 1, 1, 0),
+      contrast_diff = abs(contrast_left - contrast_right)
+    )
+  
+  result_df
+}
+
+
+# Summarize test1 and test2 in the same bin-based style
+test1_bin_data <- summarize_test_bins(test1, assigned_session_id = 19) 
+test2_bin_data <- summarize_test_bins(test2, assigned_session_id = 20)
+
+
+
+
+# Build the model matrix for test1_bin_data.
+# The vector of time-bin columns:
+time_bin_cols <- grep("^bin", names(test1_bin_data), value = TRUE)
+
+extra_predictors <- c("session_id", "trial_id", "contrast_left", "contrast_right", "contrast_diff")
+
+# Combine them
+all_predictor_cols <- c(extra_predictors, time_bin_cols)
+
+# Model matrix for test1
+test1_mat <- model.matrix(~ ., data = test1_bin_data[, all_predictor_cols])
+
+# Model matrix for test2
+test2_mat <- model.matrix(~ ., data = test2_bin_data[, all_predictor_cols])
+
+# If test data has feedback_type, we can measure accuracy/AUC
+test1_label <- test1_bin_data$success
+test2_label <- test2_bin_data$success
+
+
+### XGBOOST PREDICTION ON test1 / test2
+
+
+# 1) Predict probabilities and classes using your trained XGBoost model
+pred_prob_test1 <- predict(xgb_model_improved, newdata = test1_mat)
+pred_class_test1 <- ifelse(pred_prob_test1 > 0.5, 1, 0)
+
+# 2) Confusion Matrix & AUC
+cat("Confusion Matrix (XGB) for test1:\n")
+cm_test1 <- confusionMatrix(
+  factor(pred_class_test1),
+  factor(test1_label),
+  positive = "1"
+)
+print(cm_test1$table)
+cat("Accuracy (test1):", cm_test1$overall["Accuracy"], "\n")
+
+roc_test1 <- roc(response = test1_label, predictor = pred_prob_test1)
+cat("AUC (test1):", auc(roc_test1), "\n")
+
+
+cat("\n=== XGBoost prediction on test2 ===\n")
+pred_prob_test2 <- predict(xgb_model_improved, newdata = test2_mat)
+pred_class_test2 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cat("Confusion Matrix (XGB) for test2:\n")
+cm_test2 <- confusionMatrix(
+  factor(pred_class_test2),
+  factor(test2_label),
+  positive = "1"
+)
+print(cm_test2$table)
+cat("Accuracy (test2):", cm_test2$overall["Accuracy"], "\n")
+
+roc_test2 <- roc(response = test2_label, predictor = pred_prob_test2)
+cat("AUC (test2):", auc(roc_test2), "\n")
+
+
+### RANDOM FOREST PREDICTION ON test1 / test2
+
+
+pred_rf_prob_test1  <- predict(rf_model, test1_mat, type="prob")[,2]
+pred_rf_class_test1 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cm_test1_rf <- confusionMatrix(
+  factor(pred_rf_class_test1),
+  factor(test1_label),
+  positive = "1"
+)
+cat("Accuracy (RF) on test1:", cm_test1_rf$overall["Accuracy"], "\n")
+
+roc_test1_rf <- roc(test1_label, pred_rf_prob_test1)
+cat("AUC (RF) on test1:", auc(roc_test1_rf), "\n")
+
+
+cat("\n=== Random Forest prediction on test2 ===\n")
+pred_rf_prob_test2  <- predict(rf_model, test2_mat, type="prob")[,2]
+pred_rf_class_test2 <- ifelse(pred_prob_test2 > 0.5, 1, 0)
+
+cm_test2_rf <- confusionMatrix(
+  factor(pred_rf_class_test2),
+  factor(test2_label),
+  positive = "1"
+)
+cat("Accuracy (RF) on test2:", cm_test2_rf$overall["Accuracy"], "\n")
+
+roc_test2_rf <- roc(test2_label, pred_rf_prob_test2)
+cat("AUC (RF) on test2:", auc(roc_test2_rf), "\n")
+
+
+```
+
+# Acknowledgement
+I admit used Chatgpt to help me to build and improve my model,and give me ideas about how to write a good report, and used google to search how to build and train model,how to do feature engineering to improve model.
+
+
+
